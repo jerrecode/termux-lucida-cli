@@ -13,7 +13,7 @@ import sys
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import Request, build_opener
+from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 __version__ = "0.1.0"
 ROOT = "https://lucida.to"
@@ -136,6 +136,15 @@ def safe_worker(server: str, handoff: str) -> str:
     return f"https://{server}.lucida.to/api/fetch/request/{handoff}"
 
 
+class HTTPSOnlyRedirect(HTTPRedirectHandler):
+    """Never follow a redirect that downgrades a download to plaintext HTTP."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urlsplit(newurl).scheme != "https":
+            raise LucidaError("Refusing non-HTTPS redirect")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class Client:
     def __init__(self, base=ROOT, timeout=35.0, cookie=None, user_agent=UA):
         if base != ROOT:  # prevent passing tokens to arbitrary third-party origins
@@ -144,13 +153,11 @@ class Client:
         self.timeout = timeout
         self.cookie = cookie if cookie is not None else os.environ.get("LUCIDA_COOKIE", "")
         self.user_agent = user_agent
-        self.opener = build_opener()
+        self.opener = build_opener(HTTPSOnlyRedirect())
         self.last_request = 0.0
 
     def request(self, method, url, data=None, stream=False, attempts=3):
         headers = {"User-Agent": self.user_agent, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.8"}
-        if self.cookie and urlsplit(url).hostname == "lucida.to":
-            headers["Cookie"] = self.cookie
         if data is not None:
             headers["Content-Type"] = "application/json"
             data = json.dumps(data, separators=(",", ":")).encode("utf-8")
@@ -160,7 +167,11 @@ class Client:
                 time.sleep(delay)
             self.last_request = time.monotonic()
             try:
-                response = self.opener.open(Request(url, data=data, method=method, headers=headers), timeout=self.timeout)
+                request = Request(url, data=data, method=method, headers=headers)
+                if self.cookie and urlsplit(url).hostname == "lucida.to":
+                    # Unredirected header: never forward session credentials to a CDN or other origin.
+                    request.add_unredirected_header("Cookie", self.cookie)
+                response = self.opener.open(request, timeout=self.timeout)
                 if stream:
                     return response
                 with response:
@@ -212,7 +223,8 @@ class Client:
         except ValueError as exc:
             raise LucidaError("Lucida returned a non-JSON handoff response.") from exc
         if not isinstance(payload, dict) or not payload.get("server") or not payload.get("handoff"):
-            raise LucidaError(f"Lucida did not accept this track: {str(payload.get('error', payload))[:220]}")
+            detail = payload.get("error", payload) if isinstance(payload, dict) else payload
+            raise LucidaError(f"Lucida did not accept this track: {str(detail)[:220]}")
         return safe_worker(payload["server"], payload["handoff"])
 
     def poll(self, job_url: str, deadline=600):
