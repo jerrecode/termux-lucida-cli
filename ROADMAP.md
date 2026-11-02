@@ -27,6 +27,19 @@ This project prioritizes **native Android compatibility and correct file handlin
 - [ ] Validate a successful live download of an authorized accessible item
 - [ ] Test live regional service availability and 403 error paths
 
+## Phase 1b: response integrity and Android filesystem safety (v0.3.0)
+
+- [x] Reject lookalike Amazon music-service hosts
+- [x] Validate common audio/archive magic bytes; reject bogus media responses
+- [x] Infer file extensions from binary stream headers when the MIME type is generic
+- [x] Reject invalid Content-Length values and interrupted response reads
+- [x] Preserve never-overwrite semantics during restricted Android storage fallback
+- [x] Add disk-full and collision tests for Android no-hardlink fallback
+- [x] Reject malformed poll status immediately
+- [x] Expand local regression suite to at least 37 offline tests
+- [ ] Confirm Android shared-storage device-level semantics under concurrent writers and force-stop
+- [ ] Verify real files using a full media decoder and checksums
+
 ## Phase 2: Android field verification and recovery
 
 - [ ] Verify Android 14/15/16 on arm64 with private and shared storage targets
