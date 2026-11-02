@@ -1,6 +1,7 @@
 """Offline protocol, CLI, input validation and filesystem regression tests."""
 import base64
 import errno
+import http.client
 import os
 import io
 import json
@@ -274,6 +275,111 @@ class HardeningTests(unittest.TestCase):
                 self.assertTrue(m.download_input(c, fake_url, args))
             self.assertEqual((Path(tmp)/'Someone'/'Singles'/'My Song.flac').read_bytes(), b'fLaCpayload')
         self.assertEqual([call[0] for call in requests], ['GET','POST','GET','GET'])
+
+
+class Release03Tests(unittest.TestCase):
+    def test_reject_amazon_lookalike_hosts(self):
+        for url in ("https://music.amazon.evil.test/tracks/1", "https://music.amazon.internal/tracks/1", "https://music.amazon.com.evil.example/1"):
+            self.assertFalse(m.service_url(url))
+        for url in ("https://music.amazon.com/tracks/1", "https://music.amazon.de/albums/1", "https://music.amazon.co.jp/tracks/1"):
+            self.assertTrue(m.service_url(url))
+
+    def test_corrupted_media_is_rejected_despite_audio_header(self):
+        client = m.Client()
+        with tempfile.TemporaryDirectory() as tmp:
+            for payload in (b"This is not FLAC data", b"<html>403</html>", b"{\"error\":\"no\"}"):
+                with patch.object(client, 'request', return_value=FakeResponse(payload, {"Content-Type": "audio/flac"})):
+                    with self.assertRaises(m.LucidaError):
+                        client.download('https://us.lucida.to/api/fetch/request/abc', Path(tmp), 'Song')
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_valid_media_magic_for_common_formats(self):
+        examples = (("audio/mpeg", b"ID3"+b"0"*20, ".mp3"),
+                    ("audio/ogg", b"OggS"+b"0"*20, ".ogg"),
+                    ("audio/wav", b"RIFF"+b"0"*4+b"WAVE"+b"0"*20, ".wav"),
+                    ("audio/mp4", b"0"*4+b"ftyp"+b"0"*20, ".m4a"),
+                    ("application/zip", b"PK\x03\x04"+b"0"*20, ".zip"))
+        client = m.Client()
+        with tempfile.TemporaryDirectory() as tmp:
+            for idx, (mime, audio, ext) in enumerate(examples):
+                with self.subTest(mime=mime):
+                    with patch.object(client, 'request', return_value=FakeResponse(audio, {"Content-Type": mime})):
+                        result = client.download('https://us.lucida.to/api/fetch/request/abc', Path(tmp), f"Track{idx}")
+                        self.assertEqual(result.path.suffix, ext)
+                        self.assertEqual(result.path.read_bytes(), audio)
+
+    def test_generic_binary_content_type_sniff(self):
+        client = m.Client()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(client, 'request', return_value=FakeResponse(b'fLaC'+b'1'*100, {"Content-Type": "application/octet-stream"})):
+                result = client.download('https://us.lucida.to/api/fetch/request/abc', Path(tmp), "ActualTrack")
+            self.assertEqual(result.path.name, "ActualTrack.flac")
+            self.assertEqual(result.path.read_bytes(), b'fLaC'+b'1'*100)
+
+    def test_generic_binary_rejects_unrecognized_data(self):
+        client = m.Client()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(client, 'request', return_value=FakeResponse(b'garbage content not music', {"Content-Type": "application/octet-stream"})):
+                with self.assertRaisesRegex(m.LucidaError, 'recognizable|Invalid media'):
+                    client.download('https://us.lucida.to/api/fetch/request/abc', Path(tmp), "Broken")
+            self.assertFalse(list(Path(tmp).iterdir()))
+
+    def test_interrupted_stream_is_cleaned_up(self):
+        class Interrupted(FakeResponse):
+            def read(self, count=-1):
+                if self.tell() == 0:
+                    return super().read(3)
+                raise http.client.IncompleteRead(b'', 10)
+        client = m.Client()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(client, 'request', return_value=Interrupted(b'fLaCxxx', {"Content-Type": "audio/flac"})):
+                with self.assertRaisesRegex(m.LucidaError, 'interrupted'):
+                    client.download('https://us.lucida.to/api/fetch/request/abc', Path(tmp), "Song")
+            self.assertFalse(list(Path(tmp).iterdir()))
+
+    def test_invalid_content_length_rejected(self):
+        client = m.Client()
+        with tempfile.TemporaryDirectory() as tmp:
+            for value in ('-100', '0', 'not a number'):
+                with self.subTest(value=value):
+                    with patch.object(client, 'request', return_value=FakeResponse(b'fLaCxxx', {"Content-Type": "audio/flac", "Content-Length": value})):
+                        with self.assertRaisesRegex(m.LucidaError, 'Content-Length'):
+                            client.download('https://us.lucida.to/api/fetch/request/abc', Path(tmp), "Song")
+            self.assertFalse(list(Path(tmp).iterdir()))
+
+    def test_android_no_hardlink_fallback_collision(self):
+        client = m.Client()
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = b'fLaC'+b'a'*200
+            with patch.object(client, 'request', side_effect=lambda *args, **kwargs: FakeResponse(audio, {"Content-Type": "audio/flac"})):
+                with patch.object(m.os, 'link', side_effect=OSError(errno.EPERM, 'unsupported')):
+                    first = client.download('https://us.lucida.to/api/fetch/request/abc', Path(tmp), 'Track')
+                    second = client.download('https://us.lucida.to/api/fetch/request/abc', Path(tmp), 'Track', on_existing='rename')
+            self.assertEqual(first.path.read_bytes(), audio)
+            self.assertEqual(second.path.name, 'Track (2).flac')
+            self.assertEqual(second.path.read_bytes(), audio)
+
+    def test_android_fallback_copy_failure_does_not_leave_corrupt_file(self):
+        client = m.Client()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(client, 'request', return_value=FakeResponse(b'fLaC'+b'a'*200, {"Content-Type": "audio/flac"})):
+                with patch.object(m.os, 'link', side_effect=OSError(errno.EPERM, 'unsupported')):
+                    with patch.object(m.shutil, 'copyfileobj', side_effect=OSError(errno.ENOSPC, 'disk full')):
+                        with self.assertRaises(OSError):
+                            client.download('https://us.lucida.to/api/fetch/request/abc', Path(tmp), 'Track')
+            self.assertFalse(list(Path(tmp).iterdir()))
+
+    def test_bad_poll_worker_status_fails_fast(self):
+        client = m.Client()
+        with patch.object(client, 'request', return_value='{"message":"pending"}'):
+            with self.assertRaisesRegex(m.LucidaError, 'valid status'):
+                client.poll('https://a.lucida.to/api/fetch/request/abc', deadline=5)
+
+    def test_unsupported_http_method_and_bad_port(self):
+        client = m.Client()
+        for method, url in (('DELETE', 'https://lucida.to/'), ('GET', 'https://lucida.to:abc/search')):
+            with self.assertRaises(m.LucidaError):
+                client.request(method, url)
 
 
 if __name__ == '__main__':
