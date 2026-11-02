@@ -1,11 +1,13 @@
 """Offline protocol, CLI, input validation and filesystem regression tests."""
 import base64
+import errno
+import os
 import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 from urllib.request import Request
 import sys
 
@@ -70,14 +72,16 @@ class ProtocolTests(unittest.TestCase):
             response = FakeResponse(audio, {'Content-Type': 'audio/flac', 'Content-Disposition': 'attachment; filename="../../ABC.flac"', 'Content-Length': str(len(audio))})
             with patch.object(client, 'request', return_value=response):
                 path = client.download('https://x.lucida.to/api/fetch/request/abc', Path(tmp), 'fallback')
-            self.assertEqual(path.parent, Path(tmp))
-            self.assertEqual(path.read_bytes(), audio)
-            self.assertFalse((Path(tmp) / (path.name + '.part')).exists())
+            self.assertEqual(path.status, 'saved')
+            self.assertEqual(path.path.parent, Path(tmp))
+            self.assertEqual(path.path.read_bytes(), audio)
+            self.assertFalse(list(Path(tmp).glob('*.part')))
             response2 = FakeResponse(b'different', {'Content-Type': 'audio/flac'})
             with patch.object(client, 'request', return_value=response2):
-                same = client.download('https://x.lucida.to/api/fetch/request/abc', Path(tmp), path.stem)
-            self.assertEqual(same, path)
-            self.assertEqual(path.read_bytes(), audio)
+                same = client.download('https://x.lucida.to/api/fetch/request/abc', Path(tmp), path.path.stem)
+            self.assertEqual(same.status, 'skipped')
+            self.assertEqual(same.path, path.path)
+            self.assertEqual(path.path.read_bytes(), audio)
 
     def test_truncated_file_cleans_part(self):
         client = m.Client()
@@ -140,6 +144,136 @@ class ProtocolTests(unittest.TestCase):
     def test_cli_no_network(self):
         self.assertEqual(m.main(['services']), 0)
         self.assertEqual(m.main(['download', 'track name']), 1)
+
+
+class HardeningTests(unittest.TestCase):
+    def test_sveltekit_trailing_data_format_changes(self):
+        text = """<script>abc,{"type":"data","data":{info:{title:'X }, and " yes'},desc:'single-quote { ok }',extra: [1,2,],},"uses":{"url":1,"anything":123}}];</script>"""
+        result = m.parse_page(text)
+        self.assertEqual(result['info']['title'], 'X }, and " yes')
+        self.assertEqual(result['desc'], 'single-quote { ok }')
+
+    def test_untrusted_host_and_malformed_url(self):
+        c = m.Client()
+        for url in ('https://evil.example/x', 'http://lucida.to',
+                    'https://lucida.to:123/x', 'https://lucida.to.evil.test/a'):
+            with self.assertRaises(m.LucidaError):
+                c.request('GET', url, attempts=1)
+        for url in ('https://[', 'https://play.qobuz.com:invalid/a'):
+            self.assertFalse(m.service_url(url))
+
+    def test_no_cross_origin_redirect_for_api(self):
+        redir = m.HTTPSOnlyRedirect()
+        with self.assertRaisesRegex(m.LucidaError, 'cross-origin'):
+            redir.redirect_request(Request('https://lucida.to/api/load', data=b'{}'), None, 302, 'moved', {}, 'https://evil.example/steal')
+        with self.assertRaisesRegex(m.LucidaError, 'cross-origin'):
+            redir.redirect_request(Request('https://lucida.to/search'), None, 302, 'moved', {}, 'https://evil.example/search')
+        resp = redir.redirect_request(Request('https://one.lucida.to/api/fetch/request/id/download'), None, 302, 'moved', {}, 'https://cdn.example/file.flac')
+        self.assertEqual(resp.full_url, 'https://cdn.example/file.flac')
+
+    def test_existing_modes_are_explicit_and_never_overwrite(self):
+        c = m.Client()
+        job = 'https://x.lucida.to/api/fetch/request/abc'
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out/'Track.flac').write_bytes(b'old data')
+            def resp():
+                return FakeResponse(b'fLaC' + b'new', {'Content-Type':'audio/flac', 'Content-Disposition':'attachment; filename="Track.flac"'})
+            with patch.object(c, 'request', side_effect=lambda *a, **kw: resp()):
+                s = c.download(job, out, 'x')
+                self.assertEqual(s.status, 'skipped')
+                with self.assertRaises(m.LucidaError):
+                    c.download(job, out, 'x', on_existing='fail')
+                r = c.download(job, out, 'x', on_existing='rename')
+            self.assertEqual(r.status, 'saved')
+            self.assertEqual(r.path.name, 'Track (2).flac')
+            self.assertEqual((out/'Track.flac').read_bytes(), b'old data')
+            self.assertFalse(list(out.glob('*.part')))
+
+    def test_shared_storage_hardlink_unsupported_fallback(self):
+        c = m.Client()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(c, 'request', return_value=FakeResponse(b'fLaC'+b'a'*10, {'Content-Type':'audio/flac'})):
+                with patch.object(m.os, 'link', side_effect=OSError(errno.EPERM, 'no hardlinks')):
+                    result = c.download('https://x.lucida.to/api/fetch/request/a', Path(tmp), 'song')
+            self.assertEqual(result.status, 'saved')
+            self.assertEqual(result.path.read_bytes(), b'fLaC'+b'a'*10)
+            self.assertEqual(list(Path(tmp).glob('*.part')), [])
+
+    def test_audio_error_with_misreported_content_type(self):
+        c = m.Client()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(c, 'request', return_value=FakeResponse(b'<html>denied</html>', {'Content-Type':'application/octet-stream'})):
+                with self.assertRaisesRegex(m.LucidaError, 'disguised'):
+                    c.download('https://x.lucida.to/api/fetch/request/a', Path(tmp), 'song')
+            self.assertFalse(list(Path(tmp).iterdir()))
+
+    def test_hardlink_destination_race_no_clobber(self):
+        c = m.Client()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            original = m.os.link
+            call = [0]
+            def simultaneous(src, dst):
+                call[0] += 1
+                if call[0] == 1:
+                    Path(dst).write_bytes(b'unrelated')
+                    raise FileExistsError(errno.EEXIST, 'exists', str(dst))
+                return original(src, dst)
+            with patch.object(c, 'request', return_value=FakeResponse(b'fLaC' + b'correct', {'Content-Type':'audio/flac'})):
+                with patch.object(m.os, 'link', side_effect=simultaneous):
+                    new = c.download('https://x.lucida.to/api/fetch/request/id', out, 'song', on_existing='rename')
+            self.assertEqual((out/'song.flac').read_bytes(), b'unrelated')
+            self.assertEqual(new.path.name, 'song (2).flac')
+            self.assertFalse(list(out.glob('*.part')))
+
+    def test_unicode_filename_bytes_and_invalid_track_type(self):
+        self.assertLessEqual(len(m.safe_name('☀️' * 130).encode('utf-8')), 200)
+        with self.assertRaisesRegex(m.LucidaError, 'unsupported item type'):
+            m.tracks_from_page({'tokenExpiry':1, 'info':{'type':'artist', 'csrf':'x', 'url':'https://play.qobuz.com/track/1'}})
+        with self.assertRaisesRegex(m.LucidaError, 'invalid track listing'):
+            m.tracks_from_page({'tokenExpiry':1, 'info':{'type':'album', 'tracks':'not-a-list'}})
+
+    def test_mime_extension_disagreement_is_corrected(self):
+        c=m.Client()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(c, 'request', return_value=FakeResponse(b'fLaC'+b'payload', {'Content-Type':'audio/flac', 'Content-Disposition':'attachment; filename="Song.mp3"'})):
+                result=c.download('https://x.lucida.to/api/fetch/request/abc', Path(tmp), 'Song')
+            self.assertEqual(result.path.name, 'Song.flac')
+
+    def test_no_retry_for_api_post(self):
+        c = m.Client()
+        count = []
+        def failing(req, timeout):
+            count.append(req)
+            raise OSError('network down')
+        c.opener.open = failing
+        with patch.object(m.time, 'sleep'):
+            with self.assertRaises(m.LucidaError):
+                c.request('POST', 'https://lucida.to/api/load', {'a':1})
+        self.assertEqual(len(count), 1)
+
+    def test_full_synthetic_track_pipeline(self):
+        fake_url = 'https://play.qobuz.com/track/42'
+        page = {"info": {"type":"track", "url":fake_url, "title":"My Song", "artists":[{"name":"Someone"}],"csrf":"abc"}, "tokenExpiry":123}
+        payload = ',{"type":"data","data":'+json.dumps(page)+',"uses":{"url":1}}];'
+        c = m.Client()
+        requests = []
+        def serve(method, url, data=None, stream=False, attempts=3):
+            requests.append((method,url,data,stream))
+            if method=='GET' and '?url=' in url: return '<script>'+payload+'</script>'
+            if method=='POST': return json.dumps({'server':'edge-1','handoff':'task123'})
+            if url.endswith('/download'):
+                return FakeResponse(b'fLaC'+b'payload', {'Content-Type':'audio/flac', 'Content-Length':'11'})
+            if method=='GET' and '/api/fetch/request/' in url:
+                return '{"status":"completed"}'
+            raise AssertionError(url)
+        with tempfile.TemporaryDirectory() as tmp:
+            args=m.build_parser().parse_args(['download',fake_url,'--output',tmp])
+            with patch.object(c, 'request', side_effect=serve):
+                self.assertTrue(m.download_input(c, fake_url, args))
+            self.assertEqual((Path(tmp)/'Someone'/'Singles'/'My Song.flac').read_bytes(), b'fLaCpayload')
+        self.assertEqual([call[0] for call in requests], ['GET','POST','GET','GET'])
 
 
 if __name__ == '__main__':

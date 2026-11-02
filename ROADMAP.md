@@ -1,54 +1,57 @@
 # Development plan: Termux Lucida CLI
 
-This project prioritizes **native Android compatibility before feature breadth**.
-A checked item indicates source code and automated offline verification, not a
-claim that upstream availability or physical Android behavior was tested.
+This project prioritizes **native Android compatibility and correct file handling** over feature count. Checked tasks mean the implementation exists and **offline tests** passed, never a claim of live Lucida availability or a physical Android test.
 
-## Phase 0: first runnable prototype (v0.1.0)
+## Phase 0: initial CLI (v0.1.0)
 
-- [x] Portable Python 3.10+ package and console entry point
-- [x] Pure-Python JSON5 parsing of Lucida's SvelteKit page data
-- [x] Search tracks and albums, display exact upstream source URLs
-- [x] Resolve a direct track/album URL, obtain metadata and tokens
-- [x] Handoff request, polling and binary streaming protocol
-- [x] Sequential album and text-file batch processing
-- [x] Basic filename sanitation, atomic part-file saving, no-overwrite behavior
-- [x] Consistent errors and nonzero exit codes
-- [x] Safe session-cookie handling (do not forward cookie on redirects)
-- [x] Pure-Python offline unittest suite
-- [x] GitHub Actions Linux Python 3.10-3.13 test matrix
-- [ ] Test package installation inside real native Android Termux
-- [ ] Validate a successful live download on an authorized accessible item
-- [ ] Test Lucida's current response shapes, regional provider limits and 403 behavior
+- [x] Python 3.10+ package, console entry point, install script
+- [x] Pure Python HTTP transport and JSON5 SvelteKit metadata parsing
+- [x] Interactive-free search, explicit result selection, direct URL resolution
+- [x] Album and batch workflows, sequential handoff/poll/download implementation
+- [x] Filesystem output paths and baseline validation
+- [x] Offline unit tests and Python 3.10–3.13 CI
 
-## Phase 1: Android hardening
+## Phase 1: reliability hardening (v0.2.0)
 
-- [ ] Termux device test matrix: Android 14/15/16 and arm64
-- [ ] Permission and storage chooser diagnostics (private home vs shared storage)
-- [ ] Download progress, bytes per second, ETA, cancellation and SIGINT cleanup
-- [ ] Network interruptions, storage exhaustion and corrupted-content detection
-- [ ] Durable deduplication and resumable batch state
-- [ ] User-configurable retries and documented rate limits
+- [x] Read balanced JSON5 payload regardless of trailing SvelteKit `uses` fields
+- [x] Reject unexpected media errors and conflicting filename extensions
+- [x] Create unique partial files and publish without clobbering a destination
+- [x] Support shared Android storage when hardlinks are unavailable
+- [x] Explicit existing-file policies: skip, rename, fail; distinguish skip from save
+- [x] Prevent cross-origin redirects for metadata/API requests and reject unsafe hosts
+- [x] Avoid repeating non-idempotent POST handoff requests on network errors
+- [x] Validate malformed result types, nonempty files, and Unicode byte-length limits
+- [x] Synthetic protocol integration tests for an entire successful track download
+- [x] Package installation smoke test under Linux/Python 3.13
+- [ ] Test package installation inside native Android Termux
+- [ ] Validate a successful live download of an authorized accessible item
+- [ ] Test live regional service availability and 403 error paths
 
-## Phase 2: library workflow
+## Phase 2: Android field verification and recovery
 
-- [ ] Accurate album/disc/track order, tags and cover art
-- [ ] Optional native Termux FFmpeg conversion
-- [ ] Structured JSON output for automation
-- [ ] Public playlist metadata adapters (without assuming Chromium)
-- [ ] Review/search/match workflow to avoid incorrect artist/track picks
-- [ ] Safe concurrent downloads with token-expiry handling
+- [ ] Verify Android 14/15/16 on arm64 with private and shared storage targets
+- [ ] Test across foreground/background termination and storage permission denial
+- [ ] Support resumable transfer when upstream advertises HTTP ranges
+- [ ] Durable manifest for download history, hashes, retries and interrupted batches
+- [ ] Progress: current bytes, rate, percentage and estimated remaining time
+- [ ] Limit retries, honor server rate limits and capture actionable diagnostics
+- [ ] Native device performance/storage stress tests
 
-## Phase 3: optional enhancements
+## Phase 3: library-quality features
 
-- [ ] Touch-friendly Termux:GUI frontend (separate optional package)
-- [ ] Android system share/open intents through Termux:API
-- [ ] Account/session integration only if authorized and portable without bypassing protection
-- [ ] Optional API server, separated from core minimal CLI dependencies
+- [ ] Artist/disc/track organization, tags, cover art and library verification
+- [ ] Optional native Termux FFmpeg transcoding with quality safeguards
+- [ ] Public-playlist import without mandatory Playwright
+- [ ] Match review to avoid downloading wrong versions
+- [ ] Safe optional parallel downloads and token expiry refresh
+- [ ] Structured JSON output for scripts
 
-## Constraints
+## Phase 4: optional interfaces
 
-Do not ship unofficial Chromium wheel hacks, proot requirements or browser anti-bot
-circumvention as mandatory dependencies. Upstream Lucida API behavior is not a
-published stable contract, so each HTTP response shape requires regression tests.
-Only work with media for which the user has download rights.
+- [ ] Touch-friendly Termux:GUI (separate optional frontend)
+- [ ] Termux:API integration for file picker and Android share intents
+- [ ] Optional HTTP API separated from minimal CLI installation
+
+## Hard constraints
+
+No required Chromium, desktop, Playwright, proot, anti-bot circumvention or DRM bypass. Browser authentication/Cloudflare challenges are not solved by this browser-free project. lucida.to has no stable public protocol contract. Document and test all service assumptions and use the tool only for authorized content.

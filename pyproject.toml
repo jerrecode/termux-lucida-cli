@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "termux-lucida-cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "Lightweight browser-free Lucida CLI designed for native Termux on Android"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 authors = [{name = "jerrecode"}]
 dependencies = ["json5>=0.9,<1.0"]
 keywords = ["termux", "android", "lucida", "music", "cli"]
