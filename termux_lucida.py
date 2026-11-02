@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import http.client
 import base64
 import email.message
 import json
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import sys
 import tempfile
 from typing import NamedTuple
@@ -18,18 +20,26 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit, urljoin
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 ROOT = "https://lucida.to"
 UA = os.environ.get("LUCIDA_USER_AGENT", "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/131.0.0.0 Mobile Safari/537.36")
 DEFAULT_OUTPUT = Path(os.environ.get("LUCIDA_MUSIC_DIR", "~/storage/music" if Path("~/storage/music").expanduser().is_dir() else "~/Music")).expanduser()
 DATA_START = ',{"type":"data","data":'
 DATA_END = ',"uses":{"url":1}}];'
 FORMATS = ("original", "flac", "mp3", "ogg-vorbis", "opus", "m4a-aac", "wav")
-MIMES = {"audio/flac": ".flac", "audio/x-flac": ".flac", "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a", "audio/aac": ".aac", "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/wav": ".wav", "audio/x-wav": ".wav", "application/zip": ".zip"}
-MEDIA_EXTS = {".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".zip", ".aiff", ".alac"}
-RETRYABLE_CODES = frozenset((429, 500, 502, 503, 504))
+MIMES = {"audio/flac": ".flac", "audio/x-flac": ".flac", "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a", "audio/aac": ".aac", "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/x-m4a": ".m4a", "audio/aiff": ".aiff", "audio/x-aiff": ".aiff", "application/zip": ".zip"}
+MEDIA_EXTS = {".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".zip", ".aiff", ".alac", ".aif"}
+RETRYABLE_CODES = frozenset((408, 429, 500, 502, 503, 504))
 COUNTRIES = {"qobuz": "NL", "amazon": "", "grilledcheese": "", "deezer": "FR"}
 SERVICES = ("amazon", "qobuz", "grilledcheese", "deezer", "tidal", "soundcloud")
+# Exact store domains, not a prefix that can accidentally accept music.amazon.evil.test.
+AMAZON_DOMAINS = frozenset((
+    "music.amazon.com", "music.amazon.co.uk", "music.amazon.de", "music.amazon.fr",
+    "music.amazon.it", "music.amazon.es", "music.amazon.ca", "music.amazon.co.jp",
+    "music.amazon.com.au", "music.amazon.com.br", "music.amazon.com.mx",
+    "music.amazon.in", "music.amazon.nl", "music.amazon.se", "music.amazon.pl",
+    "music.amazon.com.tr", "music.amazon.co.za",
+))
 
 
 class LucidaError(Exception):
@@ -56,7 +66,7 @@ def service_url(value: str) -> bool:
             return False
     except (ValueError, AttributeError, TypeError):
         return False
-    return host in ("open.qobuz.com", "play.qobuz.com", "tidal.com", "listen.tidal.com", "www.tidal.com", "soundcloud.com", "www.soundcloud.com", "www.deezer.com", "deezer.com", "open.spotify.com", "music.apple.com") or (host.startswith("music.amazon.") and len(host.split(".")) >= 3)
+    return host in ("open.qobuz.com", "play.qobuz.com", "tidal.com", "listen.tidal.com", "www.tidal.com", "soundcloud.com", "www.soundcloud.com", "www.deezer.com", "deezer.com", "open.spotify.com", "music.apple.com") or host in AMAZON_DOMAINS
 
 
 def normalize_service(value: str) -> str:
@@ -234,9 +244,13 @@ class Client:
         self.last_request = 0.0
 
     def request(self, method, url, data=None, stream=False, attempts=3):
-        parsed = urlsplit(url)
-        host = parsed.hostname or ""
-        if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443) or not (host == "lucida.to" or (host.endswith(".lucida.to") and re.fullmatch(r"[a-zA-Z0-9-]{1,63}", host[:-len(".lucida.to")]))):
+        try:
+            parsed = urlsplit(url)
+            host = parsed.hostname or ""
+            port = parsed.port
+        except ValueError as exc:
+            raise LucidaError(f"Invalid request destination: {exc}") from exc
+        if parsed.scheme != "https" or parsed.username or parsed.password or port not in (None, 443) or not (host == "lucida.to" or (host.endswith(".lucida.to") and re.fullmatch(r"[a-zA-Z0-9-]{1,63}", host[:-len(".lucida.to")]))):
             raise LucidaError("Request target is not a trusted HTTPS Lucida origin")
         if method == "POST":
             attempts = 1  # repeated non-idempotent requests can create duplicate jobs
@@ -244,6 +258,10 @@ class Client:
         if data is not None:
             headers["Content-Type"] = "application/json"
             data = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        if method not in ("GET", "POST"):
+            raise LucidaError("Only GET and POST requests are supported")
+        if not 1 <= attempts <= 10:
+            raise LucidaError("Invalid retry count")
         for attempt in range(attempts):
             delay = max(0, 0.75 - (time.monotonic() - self.last_request))
             if delay:
@@ -322,6 +340,8 @@ class Client:
             if not isinstance(data, dict):
                 raise LucidaError("Lucida worker returned unexpected JSON data.")
             status = data.get("status", "")
+            if not isinstance(status, str) or not status:
+                raise LucidaError("Lucida worker response has no valid status")
             if status == "completed":
                 return
             if status in ("error", "failed", "cancelled"):
