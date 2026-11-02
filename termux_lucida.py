@@ -357,16 +357,17 @@ class Client:
                  on_existing="skip") -> DownloadResult:
         """Stream into a private unique temporary file, then publish without overwriting.
 
-        os.link is atomic and exclusive on normal POSIX filesystems; shared Android
-        storage often forbids hard links, so use O_EXCL reservation + os.replace there.
+        os.link is atomic and exclusive on normal POSIX filesystems. Android
+        shared storage often forbids hard links; an O_EXCL copy fallback preserves
+        no-overwrite semantics but may be visible to readers before copy finishes.
         """
         if on_existing not in ("skip", "rename", "fail"):
             raise LucidaError("Invalid existing-file policy")
         target_dir.mkdir(parents=True, exist_ok=True)
         with self.request("GET", job_url + "/download", stream=True) as response:
             mime = response.headers.get_content_type().lower()
-            if mime in ("text/html", "text/plain", "application/json", "application/xml"):
-                raise LucidaError(f"Worker returned {mime}, not an audio file")
+            if mime not in MIMES and not mime.startswith("audio/") and mime != "application/octet-stream":
+                raise LucidaError(f"Worker returned {mime}, not a supported audio/archive response")
             ext = MIMES.get(mime, ".bin")
             cd = response.headers.get("Content-Disposition", "")
             message = email.message.Message()
@@ -374,13 +375,13 @@ class Client:
             candidate = message.get_filename() or fallback
             name = safe_name(candidate)
             old_ext = Path(name).suffix.lower()
-            compatible = {".ogg", ".opus"} if mime == "audio/ogg" else {ext}
+            compatible = {".ogg", ".opus"} if mime in ("audio/ogg", "audio/opus") else {ext}
             if mime in MIMES and old_ext not in compatible:
                 name = str(Path(name).with_suffix(ext)) if old_ext in MEDIA_EXTS else name + ext
             elif old_ext not in MEDIA_EXTS:
                 name += ext
             path = target_dir / name
-            if path.exists() or path.is_symlink():
+            if mime != "application/octet-stream" and (path.exists() or path.is_symlink()):
                 if on_existing == "skip":
                     if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
                         raise LucidaError(f"Existing destination is not a valid nonempty file: {path}")
@@ -389,7 +390,9 @@ class Client:
                 if on_existing == "fail":
                     raise LucidaError(f"Destination already exists: {path}")
             size = response.headers.get("Content-Length")
-            expected = int(size) if size and size.isdecimal() else None
+            if size is not None and (not size.isdecimal() or int(size) <= 0):
+                raise LucidaError(f"Invalid download Content-Length: {size[:60]}")
+            expected = int(size) if size else None
             fd, temporary = tempfile.mkstemp(prefix=".lucida-", suffix=".part", dir=target_dir)
             part = Path(temporary)
             total = 0
@@ -397,12 +400,15 @@ class Client:
                 with os.fdopen(fd, "wb") as output:
                     first = True
                     while True:
-                        chunk = response.read(65536)
+                        try:
+                            chunk = response.read(65536)
+                        except (http.client.HTTPException, OSError) as exc:
+                            raise LucidaError(f"Download stream interrupted: {exc}") from exc
                         if not chunk:
                             break
                         if first:
                             first = False
-                            if chunk.lstrip()[:1] in (b"<", b"{") and mime not in ("application/zip",):
+                            if chunk.lstrip()[:1] in (b"<", b"{", b"["):
                                 raise LucidaError("Worker returned an HTML/JSON error disguised as media")
                         total += len(chunk)
                         output.write(chunk)
@@ -410,9 +416,32 @@ class Client:
                     os.fsync(output.fileno())
                 if not total or (expected is not None and total != expected):
                     raise LucidaError(f"Incomplete download: {total} bytes (expected {expected})")
+                if not _valid_audio_signature(part, mime):
+                    raise LucidaError(f"Invalid media signature for {mime}; not saving a corrupt or disguised response")
+                if mime == "audio/aac" and _sniff_media_extension(part) == ".m4a":
+                    name = str(Path(name).with_suffix(".m4a"))
+                    path = target_dir / name
+                if mime == "application/octet-stream":
+                    detected = _sniff_media_extension(part)
+                    if detected is None:
+                        raise LucidaError("Octet-stream response does not contain recognizable audio/archive data")
+                    if Path(name).suffix.lower() not in MEDIA_EXTS:
+                        name = (name[:-4] if name.endswith(".bin") else name) + detected
+                    elif Path(name).suffix.lower() != detected:
+                        name = str(Path(name).with_suffix(detected))
+                    path = target_dir / name
                 root, suffix = os.path.splitext(name)
                 for n in range(1, 10_000):
-                    chosen = path if n == 1 else target_dir / f"{root} ({n}){suffix}"
+                    if n == 1:
+                        chosen = path
+                    else:
+                        # Keep the final path segment below the Android/filesystem
+                        # 255-byte limit even after adding the collision number.
+                        postfix = f" ({n}){suffix}"
+                        prefix = root
+                        while len((prefix + postfix).encode("utf-8")) > 240:
+                            prefix = prefix[:-1]
+                        chosen = target_dir / f"{prefix}{postfix}"
                     try:
                         _publish_file(part, chosen)
                         print(f"  saved {total:,} bytes: {chosen}")
