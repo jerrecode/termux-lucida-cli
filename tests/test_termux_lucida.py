@@ -88,6 +88,35 @@ class ProtocolTests(unittest.TestCase):
                     client.download('https://x.lucida.to/api/fetch/request/abc', Path(tmp), 'broken')
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
+    def test_handoff_request_has_expected_contract(self):
+        client = m.Client()
+        calls = []
+        def fake_request(method, url, data=None, **kw):
+            calls.append((method, url, data))
+            return json.dumps({'server': 'download-2', 'handoff': 'a_123'})
+        with patch.object(client, 'request', side_effect=fake_request):
+            job_url = client.start({'url': 'https://play.qobuz.com/track/77', 'csrf': 'token1', 'csrfFallback': None}, 999, 'original', 'NL')
+        self.assertEqual(job_url, 'https://download-2.lucida.to/api/fetch/request/a_123')
+        self.assertEqual(calls[0][0], 'POST')
+        self.assertEqual(calls[0][2]['token']['expiry'], 999)
+        self.assertEqual(calls[0][2]['account'], {'id': 'NL', 'type': 'country'})
+        self.assertIn('url=%2Fapi%2Ffetch%2Fstream%2Fv2', calls[0][1])
+
+    def test_handoff_invalid_body(self):
+        client = m.Client()
+        with patch.object(client, 'request', return_value='[]'):
+            with self.assertRaises(m.LucidaError):
+                client.start({'url': 'https://play.qobuz.com/track/77', 'csrf': 'token'}, 123)
+
+    def test_poll_complete_and_failed(self):
+        client = m.Client()
+        with patch.object(client, 'request', side_effect=['{"status":"processing"}', '{"status":"completed"}']):
+            with patch.object(m.time, 'sleep'):
+                client.poll('https://download.lucida.to/api/fetch/request/id', deadline=2)
+        with patch.object(client, 'request', return_value='{"status":"error", "message":"unavailable"}'):
+            with self.assertRaisesRegex(m.LucidaError, 'unavailable'):
+                client.poll('https://download.lucida.to/api/fetch/request/id', deadline=2)
+
     def test_cookie_unredirected_and_https_only(self):
         client = m.Client(cookie="cf_clearance=secret")
         class Capture:
