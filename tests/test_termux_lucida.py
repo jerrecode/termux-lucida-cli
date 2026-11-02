@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.request import Request
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -86,6 +87,22 @@ class ProtocolTests(unittest.TestCase):
                 with self.assertRaises(m.LucidaError):
                     client.download('https://x.lucida.to/api/fetch/request/abc', Path(tmp), 'broken')
             self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_cookie_unredirected_and_https_only(self):
+        client = m.Client(cookie="cf_clearance=secret")
+        class Capture:
+            def open(self, req, timeout):
+                self.request = req
+                return FakeResponse(b"ok", {"Content-Type": "text/plain"})
+        fake = Capture()
+        client.opener = fake
+        self.assertEqual(client.request("GET", "https://lucida.to/"), "ok")
+        self.assertNotIn("Cookie", fake.request.headers)
+        self.assertEqual(fake.request.unredirected_hdrs["Cookie"], "cf_clearance=secret")
+        self.assertEqual(client.request("GET", "https://a.lucida.to/"), "ok")
+        self.assertNotIn("Cookie", fake.request.unredirected_hdrs)
+        with self.assertRaises(m.LucidaError):
+            m.HTTPSOnlyRedirect().redirect_request(Request("https://lucida.to/"), None, 302, "redirect", {}, "http://evil.test")
 
     def test_pick_explicit_required(self):
         with self.assertRaises(m.LucidaError):
