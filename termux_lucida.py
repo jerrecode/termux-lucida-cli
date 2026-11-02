@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import base64
 import email.message
 import json
@@ -10,12 +11,14 @@ from pathlib import Path
 import re
 import shutil
 import sys
+import tempfile
+from typing import NamedTuple
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode, urlsplit, urljoin
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 ROOT = "https://lucida.to"
 UA = os.environ.get("LUCIDA_USER_AGENT", "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/131.0.0.0 Mobile Safari/537.36")
 DEFAULT_OUTPUT = Path(os.environ.get("LUCIDA_MUSIC_DIR", "~/storage/music" if Path("~/storage/music").expanduser().is_dir() else "~/Music")).expanduser()
@@ -24,6 +27,7 @@ DATA_END = ',"uses":{"url":1}}];'
 FORMATS = ("original", "flac", "mp3", "ogg-vorbis", "opus", "m4a-aac", "wav")
 MIMES = {"audio/flac": ".flac", "audio/x-flac": ".flac", "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a", "audio/aac": ".aac", "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/wav": ".wav", "audio/x-wav": ".wav", "application/zip": ".zip"}
 MEDIA_EXTS = {".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".zip", ".aiff", ".alac"}
+RETRYABLE_CODES = frozenset((429, 500, 502, 503, 504))
 COUNTRIES = {"qobuz": "NL", "amazon": "", "grilledcheese": "", "deezer": "FR"}
 SERVICES = ("amazon", "qobuz", "grilledcheese", "deezer", "tidal", "soundcloud")
 
@@ -33,15 +37,24 @@ class LucidaError(Exception):
 
 
 def safe_name(value: str, fallback: str = "Unknown") -> str:
-    value = re.sub(r'[\\/\x00-\x1f\x7f<>:"|?*]', "_", str(value or ""))
+    """Single path segment only, safe for both private Termux and shared Android storage."""
+    value = re.sub(r'[\\/\x00-\x1f\x7f<>:"|?*\u202a-\u202e\u2066-\u2069]', "_", str(value or ""))
     value = re.sub(r"\s+", " ", value).strip(" .")
-    return (value[:145].rstrip(" .") or fallback)
+    # Android/Linux filesystem components are usually limited to 255 *bytes*.
+    # A character cap alone fails for emoji/CJK filenames encoded as UTF-8.
+    name = value[:145].rstrip(" .") or fallback
+    while len(name.encode("utf-8")) > 200:
+        name = name[:-1]
+    return name.rstrip(" .") or fallback
 
 
 def service_url(value: str) -> bool:
-    parsed = urlsplit(value)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443):
+    try:
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443):
+            return False
+    except (ValueError, AttributeError, TypeError):
         return False
     return host in ("open.qobuz.com", "play.qobuz.com", "tidal.com", "listen.tidal.com", "www.tidal.com", "soundcloud.com", "www.soundcloud.com", "www.deezer.com", "deezer.com", "open.spotify.com", "music.apple.com") or (host.startswith("music.amazon.") and len(host.split(".")) >= 3)
 
@@ -51,16 +64,61 @@ def normalize_service(value: str) -> str:
 
 
 def parse_page(raw: str):
-    """Parse SvelteKit JSON5 payload; fail closed when website markup changes."""
+    """Read the SvelteKit JSON5 `data` object without depending on an exact terminator.
+
+    SvelteKit changes the trailing `uses` object occasionally.  The JSON5 data
+    field itself is a balanced value; strings and comments must not terminate it.
+    """
     start = raw.find(DATA_START)
     if start == -1:
-        raise LucidaError("Lucida page data not found. The site may have changed or a browser verification is required.")
+        raise LucidaError("Lucida page data not found; browser verification or upstream layout change.")
     start += len(DATA_START)
-    end = raw.find(DATA_END, start)
-    if end < 0:
-        raise LucidaError("Lucida page data terminator not found (upstream layout changed).")
+    while start < len(raw) and raw[start].isspace():
+        start += 1
+    if start >= len(raw) or raw[start] not in "{[":
+        raise LucidaError("Lucida page data is not a JSON5 object/array.")
+    stack = []
+    quote = None
+    escaped = False
+    comment = None
+    end = None
+    i = start
+    while i < len(raw):
+        c = raw[i]
+        next_c = raw[i + 1] if i + 1 < len(raw) else ""
+        if comment == "line":
+            if c in "\r\n":
+                comment = None
+        elif comment == "block":
+            if c == "*" and next_c == "/":
+                comment = None
+                i += 1
+        elif quote:
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c == "/" and next_c in ("/", "*"):
+            comment = "line" if next_c == "/" else "block"
+            i += 1
+        elif c in "{[":
+            stack.append(c)
+        elif c in "}]":
+            if not stack or (stack[-1], c) not in (("{", "}"), ("[", "]")):
+                raise LucidaError("Malformed Lucida page data nesting.")
+            stack.pop()
+            if not stack:
+                end = i + 1
+                break
+        i += 1
+    if end is None:
+        raise LucidaError("Incomplete Lucida JSON5 page payload.")
     try:
-        import json5  # pure-Python package, not Playwright/Chromium
+        import json5
         return json5.loads(raw[start:end])
     except (ValueError, ImportError) as exc:
         raise LucidaError(f"Could not decode Lucida JSON5 data: {exc}") from exc
@@ -117,11 +175,16 @@ def tracks_from_page(page):
     info = page["info"]
     if info.get("type") == "album":
         tracks = info.get("tracks") or []
-    else:
+    elif info.get("type") in ("track", "song"):
+
         one = dict(info)
         one.setdefault("csrf", single_token(page.get("token")))
         one.setdefault("csrfFallback", None)
         tracks = [one]
+    else:
+        raise LucidaError("Lucida returned an unsupported item type")
+    if not isinstance(tracks, list):
+        raise LucidaError("Lucida returned an invalid track listing")
     tracks = [t for t in tracks if isinstance(t, dict) and isinstance(t.get("url"), str) and t.get("csrf")]
     if not tracks:
         raise LucidaError("No downloadable tracks or valid Lucida tokens were returned.")
@@ -137,12 +200,26 @@ def safe_worker(server: str, handoff: str) -> str:
 
 
 class HTTPSOnlyRedirect(HTTPRedirectHandler):
-    """Never follow a redirect that downgrades a download to plaintext HTTP."""
+    """Do not redirect POST bodies or metadata requests to untrusted origins."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if urlsplit(newurl).scheme != "https":
-            raise LucidaError("Refusing non-HTTPS redirect")
+        newurl = urljoin(req.full_url, newurl)
+        p = urlsplit(newurl)
+        old = urlsplit(req.full_url)
+        if p.scheme != "https" or p.username or p.password or p.port not in (None, 443):
+            raise LucidaError("Refusing unsafe/non-HTTPS redirect")
+        if req.get_method() != "GET" and p.netloc != old.netloc:
+            raise LucidaError("Refusing cross-origin redirect of API request body")
+        # Download bytes may be hosted on a HTTPS CDN; page data must stay on Lucida.
+        if not old.path.endswith("/download") and p.hostname != old.hostname:
+            raise LucidaError("Refusing cross-origin redirect of Lucida page/API")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class DownloadResult(NamedTuple):
+    path: Path
+    status: str  # saved or skipped
+    size: int
 
 
 class Client:
@@ -157,6 +234,12 @@ class Client:
         self.last_request = 0.0
 
     def request(self, method, url, data=None, stream=False, attempts=3):
+        parsed = urlsplit(url)
+        host = parsed.hostname or ""
+        if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443) or not (host == "lucida.to" or (host.endswith(".lucida.to") and re.fullmatch(r"[a-zA-Z0-9-]{1,63}", host[:-len(".lucida.to")]))):
+            raise LucidaError("Request target is not a trusted HTTPS Lucida origin")
+        if method == "POST":
+            attempts = 1  # repeated non-idempotent requests can create duplicate jobs
         headers = {"User-Agent": self.user_agent, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.8"}
         if data is not None:
             headers["Content-Type"] = "application/json"
@@ -183,7 +266,7 @@ class Client:
                 status = exc.code
                 if status == 403:
                     raise LucidaError("HTTP 403 from Lucida: access denied or browser verification required. See README authentication notes.") from exc
-                if status not in (429, 500, 502, 503, 504) or attempt + 1 >= attempts:
+                if status not in RETRYABLE_CODES or attempt + 1 >= attempts:
                     raise LucidaError(f"HTTP {status} from {urlsplit(url).hostname}") from exc
                 retry_after = exc.headers.get("Retry-After", "")
                 try:
@@ -250,50 +333,106 @@ class Client:
             time.sleep(1.5)
         raise LucidaError("Lucida processing timed out")
 
-    def download(self, job_url: str, target_dir: Path, fallback: str) -> Path:
+    def download(self, job_url: str, target_dir: Path, fallback: str,
+                 on_existing="skip") -> DownloadResult:
+        """Stream into a private unique temporary file, then publish without overwriting.
+
+        os.link is atomic and exclusive on normal POSIX filesystems; shared Android
+        storage often forbids hard links, so use O_EXCL reservation + os.replace there.
+        """
+        if on_existing not in ("skip", "rename", "fail"):
+            raise LucidaError("Invalid existing-file policy")
         target_dir.mkdir(parents=True, exist_ok=True)
         with self.request("GET", job_url + "/download", stream=True) as response:
             mime = response.headers.get_content_type().lower()
-            if mime in ("text/html", "text/plain", "application/json"):
+            if mime in ("text/html", "text/plain", "application/json", "application/xml"):
                 raise LucidaError(f"Worker returned {mime}, not an audio file")
             ext = MIMES.get(mime, ".bin")
             cd = response.headers.get("Content-Disposition", "")
             message = email.message.Message()
             message["Content-Disposition"] = cd
             candidate = message.get_filename() or fallback
-            # An unrecognized extension is not an audio type; preserve known ext only.
             name = safe_name(candidate)
-            if Path(name).suffix.lower() not in MEDIA_EXTS:
+            old_ext = Path(name).suffix.lower()
+            compatible = {".ogg", ".opus"} if mime == "audio/ogg" else {ext}
+            if mime in MIMES and old_ext not in compatible:
+                name = str(Path(name).with_suffix(ext)) if old_ext in MEDIA_EXTS else name + ext
+            elif old_ext not in MEDIA_EXTS:
                 name += ext
             path = target_dir / name
-            if path.exists():
-                print(f"  exists, skipping: {path}")
-                return path
-            part = target_dir / (name + ".part")
+            if path.exists() or path.is_symlink():
+                if on_existing == "skip":
+                    if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
+                        raise LucidaError(f"Existing destination is not a valid nonempty file: {path}")
+                    print(f"  skipped existing file (not verified identical): {path}")
+                    return DownloadResult(path, "skipped", path.stat().st_size)
+                if on_existing == "fail":
+                    raise LucidaError(f"Destination already exists: {path}")
             size = response.headers.get("Content-Length")
             expected = int(size) if size and size.isdecimal() else None
+            fd, temporary = tempfile.mkstemp(prefix=".lucida-", suffix=".part", dir=target_dir)
+            part = Path(temporary)
             total = 0
             try:
-                with part.open("wb") as output:
+                with os.fdopen(fd, "wb") as output:
+                    first = True
                     while True:
                         chunk = response.read(65536)
                         if not chunk:
                             break
+                        if first:
+                            first = False
+                            if chunk.lstrip()[:1] in (b"<", b"{") and mime not in ("application/zip",):
+                                raise LucidaError("Worker returned an HTML/JSON error disguised as media")
                         total += len(chunk)
                         output.write(chunk)
                     output.flush()
                     os.fsync(output.fileno())
                 if not total or (expected is not None and total != expected):
-                    raise LucidaError(f"Truncated file: {total} bytes (expected {expected})")
-                # Do not overwrite a preexisting filename.
-                if path.exists():
-                    raise LucidaError(f"Destination already exists: {path}")
-                part.replace(path)
-            except BaseException:
+                    raise LucidaError(f"Incomplete download: {total} bytes (expected {expected})")
+                root, suffix = os.path.splitext(name)
+                for n in range(1, 10_000):
+                    chosen = path if n == 1 else target_dir / f"{root} ({n}){suffix}"
+                    try:
+                        _publish_file(part, chosen)
+                        print(f"  saved {total:,} bytes: {chosen}")
+                        return DownloadResult(chosen, "saved", total)
+                    except FileExistsError:
+                        if on_existing == "skip":
+                            if not chosen.is_file() or chosen.is_symlink() or chosen.stat().st_size == 0:
+                                raise LucidaError(f"Existing destination is not a valid file: {chosen}")
+                            print(f"  skipped existing file (not verified identical): {chosen}")
+                            return DownloadResult(chosen, "skipped", chosen.stat().st_size)
+                        if on_existing == "fail":
+                            raise LucidaError(f"Destination already exists: {chosen}")
+                raise LucidaError("Too many duplicate file names")
+            finally:
                 part.unlink(missing_ok=True)
-                raise
-            print(f"  saved {total:,} bytes: {path}")
-            return path
+
+
+def _publish_file(part: Path, destination: Path) -> None:
+    """Commit a complete temporary file without overwriting a destination."""
+    try:
+        os.link(part, destination)
+        return
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            raise FileExistsError(str(destination)) from exc
+        if exc.errno not in (errno.EPERM, errno.EACCES, errno.EOPNOTSUPP,
+                             errno.ENOTSUP, errno.ENOSYS, errno.EMLINK, errno.EXDEV):
+            raise
+    # Android emulated storage typically does not support hard links. Reserve
+    # the final filename for the brief atomic rename operation only.
+    try:
+        fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise
+    try:
+        os.close(fd)
+        os.replace(part, destination)
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
 
 
 def label_track(t, info, index=1):
@@ -331,6 +470,7 @@ def download_input(client, value, args):
     out = Path(args.output).expanduser()
     total = len(tracks)
     ok = 0
+    skipped = 0
     for i, track in enumerate(tracks, 1):
         artist, album, title = label_track(track, info, i)
         dest = out if args.flat else out / safe_name(artist) / safe_name(album or "Singles")
@@ -340,12 +480,15 @@ def download_input(client, value, args):
         try:
             job = client.start(track, expiry, args.format, country)
             client.poll(job, deadline=args.timeout)
-            client.download(job, dest, safe_name(title))
-            ok += 1
+            result = client.download(job, dest, safe_name(title), args.on_existing)
+            if result.status == "skipped":
+                skipped += 1
+            else:
+                ok += 1
         except (LucidaError, OSError) as exc:
             print(f"  FAILED: {exc}", file=sys.stderr)
-    print(f"Completed: {ok}/{total} tracks")
-    return ok == total
+    print(f"Completed: {ok} saved, {skipped} skipped, {total - ok - skipped} failed of {total}")
+    return ok + skipped == total
 
 
 def doctor(client, live=False):
@@ -383,6 +526,7 @@ def build_parser():
         cmd.add_argument("--pick", type=int, default=None, help="Explicit 1-based result to use for a text query")
         cmd.add_argument("--output", "-o", default=str(DEFAULT_OUTPUT), help="Destination folder")
         cmd.add_argument("--flat", action="store_true", help="No Artist/Album subfolders")
+        cmd.add_argument("--on-existing", choices=("skip", "rename", "fail"), default="skip", help="Handle existing filename (never overwrite)")
         cmd.add_argument("--format", choices=FORMATS, default="original", help="Lucida requested output format")
         cmd.add_argument("--country", default="", help="Provider region, e.g. NL or US; default auto")
         cmd.add_argument("--timeout", type=int, default=600, help="Max wait time per processing job")
