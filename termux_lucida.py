@@ -459,6 +459,62 @@ class Client:
                 part.unlink(missing_ok=True)
 
 
+def _sniff_media_extension(path: Path) -> str | None:
+    """Recognize basic media container headers when servers send octet-stream."""
+    with path.open("rb") as source:
+        head = source.read(32)
+    if head.startswith(b"fLaC"):
+        return ".flac"
+    if head.startswith(b"OggS"):
+        return ".ogg"
+    if head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xff and (head[1] & 0xe0) == 0xe0):
+        return ".mp3"
+    if head.startswith(b"RIFF") and head[8:12] == b"WAVE":
+        return ".wav"
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return ".m4a"
+    if head.startswith(b"FORM") and head[8:12] in (b"AIFF", b"AIFC"):
+        return ".aiff"
+    if head.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+        return ".zip"
+    return None
+
+
+def _valid_audio_signature(path: Path, mime: str) -> bool:
+    """Reject HTML/error payloads and common wrong-format responses.
+
+    This is a header sanity check, not a decoder or cryptographic file verifier.
+    Less common codecs and unknown content types remain unsupported here.
+    """
+    with path.open("rb") as file:
+        head = file.read(32)
+    if not head:
+        return False
+    stripped = head.lstrip().lower()
+    if stripped.startswith((b"<", b"{", b"[", b"<!doctype", b"error", b"forbidden")):
+        return False
+    if mime in ("audio/flac", "audio/x-flac"):
+        return head.startswith(b"fLaC")
+    if mime in ("audio/mpeg", "audio/mp3"):
+        return head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xff and (head[1] & 0xe0) == 0xe0)
+    if mime in ("audio/ogg", "audio/opus"):
+        return head.startswith(b"OggS")
+    if mime in ("audio/wav", "audio/x-wav"):
+        return head.startswith(b"RIFF") and head[8:12] == b"WAVE"
+    if mime in ("audio/mp4", "audio/x-m4a", "audio/aac"):
+        return (len(head) >= 12 and head[4:8] == b"ftyp") or (mime == "audio/aac" and head[0] == 0xff and (head[1] & 0xf0) == 0xf0)
+    if mime in ("audio/aiff", "audio/x-aiff"):
+        return head.startswith(b"FORM") and head[8:12] in (b"AIFF", b"AIFC")
+    if mime == "application/zip":
+        return head.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"))
+    if mime == "application/octet-stream":
+        return (head.startswith((b"fLaC", b"OggS", b"ID3", b"RIFF", b"FORM", b"PK\x03\x04"))
+                or (len(head) >= 12 and head[4:8] == b"ftyp")
+                or (len(head) >= 2 and head[0] == 0xff and (head[1] & 0xe0) == 0xe0))
+    # Unknown formats cannot be validated: fail rather than saving arbitrary data.
+    return False
+
+
 def _publish_file(part: Path, destination: Path) -> None:
     """Commit a complete temporary file without overwriting a destination."""
     try:
@@ -470,17 +526,29 @@ def _publish_file(part: Path, destination: Path) -> None:
         if exc.errno not in (errno.EPERM, errno.EACCES, errno.EOPNOTSUPP,
                              errno.ENOTSUP, errno.ENOSYS, errno.EMLINK, errno.EXDEV):
             raise
-    # Android emulated storage typically does not support hard links. Reserve
-    # the final filename for the brief atomic rename operation only.
+    # Android shared storage (FUSE/sdcardfs) frequently rejects os.link().
+    # Exclusive creation plus copying is truly no-clobber, unlike reserve+replace,
+    # which could overwrite a file created by another process during a race.
+    # This fallback cannot guarantee that readers will never observe a partial
+    # final file if the process is killed while copying; see README.
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(destination, flags, 0o600)
+    identity = os.fstat(fd)
     try:
-        fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        raise
-    try:
-        os.close(fd)
-        os.replace(part, destination)
+        with os.fdopen(fd, "wb") as output, part.open("rb") as source:
+            shutil.copyfileobj(source, output, length=1024 * 1024)
+            output.flush()
+            os.fsync(output.fileno())
     except BaseException:
-        destination.unlink(missing_ok=True)
+        # Only delete the file that we created. Never unlink a replacement.
+        try:
+            current = os.stat(destination, follow_symlinks=False)
+            if stat.S_ISREG(current.st_mode) and (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino):
+                destination.unlink()
+        except OSError:
+            pass
         raise
 
 
